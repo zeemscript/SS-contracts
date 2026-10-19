@@ -1,9 +1,10 @@
 //! Storage helpers: instance for config, persistent for escrow data, invoice records, and positions.
 
-use soroban_sdk::{Address, BytesN, Env, Symbol};
+use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
 
 use crate::types::{
-    Config, EmergencyApprovals, EscrowData, InvoiceData, MultiSigConfig, StorageKey,
+    CategoryFeeSchedule, Config, DisputeData, EmergencyApprovals, EscrowData, InstallmentMilestone,
+    InvestmentRecord, InvoiceCategory, InvoiceData, MultiSigConfig, SettlementProposal, StorageKey,
 };
 
 /// Ledgers below which a persistent entry's TTL is extended (~7 days at 5s/ledger).
@@ -17,7 +18,6 @@ pub fn bump_persistent(env: &Env, key: &StorageKey) {
         .persistent()
         .extend_ttl(key, TTL_THRESHOLD, MIN_TTL_EXTEND);
 }
-
 
 /// Load contract config from instance storage, bumping instance TTL.
 pub fn get_config(env: &Env) -> Option<Config> {
@@ -66,11 +66,7 @@ pub fn has_escrow(env: &Env, inv_id: Symbol) -> bool {
 
 /// Remove escrow data and all per-funder contribution records for an invoice from
 /// persistent storage (storage footprint cleanup).
-pub fn remove_escrow_state(
-    env: &Env,
-    inv_id: Symbol,
-    funders: &soroban_sdk::Vec<Address>,
-) {
+pub fn remove_escrow_state(env: &Env, inv_id: Symbol, funders: &soroban_sdk::Vec<Address>) {
     for funder in funders.iter() {
         env.storage()
             .persistent()
@@ -99,11 +95,7 @@ pub fn set_nonce(env: &Env, buyer: &Address, nonce: u64) {
 }
 
 /// Get the amount funded by a specific funder for an invoice.
-pub fn get_funder_amount(
-    env: &Env,
-    inv_id: Symbol,
-    funder: &Address,
-) -> i128 {
+pub fn get_funder_amount(env: &Env, inv_id: Symbol, funder: &Address) -> i128 {
     let key = StorageKey::FunderAmount(inv_id, funder.clone());
     let amount = env.storage().persistent().get(&key).unwrap_or(0);
     if env.storage().persistent().has(&key) {
@@ -113,12 +105,7 @@ pub fn get_funder_amount(
 }
 
 /// Set the amount funded by a specific funder for an invoice.
-pub fn set_funder_amount(
-    env: &Env,
-    inv_id: Symbol,
-    funder: &Address,
-    amount: i128,
-) {
+pub fn set_funder_amount(env: &Env, inv_id: Symbol, funder: &Address, amount: i128) {
     let key = StorageKey::FunderAmount(inv_id, funder.clone());
     if amount == 0 {
         env.storage().persistent().remove(&key);
@@ -149,9 +136,7 @@ pub fn set_whitelisted(env: &Env, buyer: &Address, allowed: bool) {
     }
 }
 
-// ── Funding invoice (BytesN<32>) storage for position management ───────
-
-use soroban_sdk::BytesN;
+// ── Funding invoice (BytesN<32>) storage for position management ───────────
 
 use crate::types::FundingInvoice;
 
@@ -173,29 +158,6 @@ pub fn has_invoice(env: &soroban_sdk::Env, invoice_id: BytesN<32>) -> bool {
         .has(&StorageKey::Invoice(invoice_id))
 }
 
-pub fn get_investor_position(
-    env: &soroban_sdk::Env,
-    invoice_id: BytesN<32>,
-    investor: &Address,
-) -> i128 {
-    env.storage()
-        .persistent()
-        .get(&StorageKey::InvestorPosition(invoice_id, investor.clone()))
-        .unwrap_or(0)
-}
-
-pub fn set_investor_position(
-    env: &soroban_sdk::Env,
-    invoice_id: BytesN<32>,
-    investor: &Address,
-    amount: i128,
-) {
-    let key = StorageKey::InvestorPosition(invoice_id, investor.clone());
-    if amount == 0 {
-        env.storage().persistent().remove(&key);
-    } else {
-        env.storage().persistent().set(&key, &amount);
-    }
 /// Load the emergency multi-sig admin configuration.
 pub fn get_emergency_config(env: &Env) -> Option<MultiSigConfig> {
     env.storage()
@@ -252,6 +214,27 @@ pub fn set_invoice_record(env: &Env, inv_id: &BytesN<32>, data: &InvoiceData) {
     let key = StorageKey::InvoiceRecord(inv_id.clone());
     env.storage().persistent().set(&key, data);
     bump_persistent(env, &key);
+}
+
+pub fn get_settlement_proposal(env: &Env, inv_id: &BytesN<32>) -> Option<SettlementProposal> {
+    let key = StorageKey::SettlementProposal(inv_id.clone());
+    let proposal = env.storage().persistent().get(&key);
+    if proposal.is_some() {
+        bump_persistent(env, &key);
+    }
+    proposal
+}
+
+pub fn set_settlement_proposal(env: &Env, inv_id: &BytesN<32>, proposal: &SettlementProposal) {
+    let key = StorageKey::SettlementProposal(inv_id.clone());
+    env.storage().persistent().set(&key, proposal);
+    bump_persistent(env, &key);
+}
+
+pub fn remove_settlement_proposal(env: &Env, inv_id: &BytesN<32>) {
+    env.storage()
+        .persistent()
+        .remove(&StorageKey::SettlementProposal(inv_id.clone()));
 }
 
 /// Check if an invoice record exists for BytesN<32>.
@@ -321,4 +304,248 @@ pub fn set_escrow_id_by_index(env: &soroban_sdk::Env, index: u32, invoice_id: &S
     env.storage()
         .persistent()
         .set(&StorageKey::EscrowIdByIndex(index), invoice_id);
+}
+
+/// Get the configured platform fee (bps) for an invoice category, if the
+/// admin has set one via `set_category_fee`.
+pub fn get_category_fee(env: &Env, category: InvoiceCategory) -> Option<CategoryFeeSchedule> {
+    env.storage()
+        .instance()
+        .get(&StorageKey::CategoryFee(category))
+}
+
+/// Set the platform fee (bps) for an invoice category.
+pub fn set_category_fee(env: &Env, category: InvoiceCategory, schedule: &CategoryFeeSchedule) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::CategoryFee(category), schedule);
+}
+
+/// Get the dispute record for an invoice, if one has ever been raised.
+pub fn get_dispute(env: &Env, inv_id: &Symbol) -> Option<DisputeData> {
+    let key = StorageKey::Dispute(inv_id.clone());
+    let data = env.storage().persistent().get(&key);
+    if data.is_some() {
+        bump_persistent(env, &key);
+    }
+    data
+}
+
+/// Save the dispute record for an invoice.
+pub fn set_dispute(env: &Env, inv_id: &Symbol, data: &DisputeData) {
+    let key = StorageKey::Dispute(inv_id.clone());
+    env.storage().persistent().set(&key, data);
+    bump_persistent(env, &key);
+}
+
+/// Load the installment repayment milestone schedule for an invoice, if one
+/// has been configured. Extends the entry's TTL on every access.
+pub fn get_installment_schedule(
+    env: &Env,
+    inv_id: &Symbol,
+) -> Option<soroban_sdk::Vec<InstallmentMilestone>> {
+    let key = StorageKey::InstallmentSchedule(inv_id.clone());
+    let data = env.storage().persistent().get(&key);
+    if data.is_some() {
+        bump_persistent(env, &key);
+    }
+    data
+}
+
+/// Save the installment repayment milestone schedule for an invoice, extending its TTL.
+pub fn set_installment_schedule(
+    env: &Env,
+    inv_id: &Symbol,
+    schedule: &soroban_sdk::Vec<InstallmentMilestone>,
+) {
+    let key = StorageKey::InstallmentSchedule(inv_id.clone());
+    env.storage().persistent().set(&key, schedule);
+    bump_persistent(env, &key);
+}
+
+/// Remove the installment schedule for an invoice (used by storage cleanup).
+pub fn remove_installment_schedule(env: &Env, inv_id: &Symbol) {
+    env.storage()
+        .persistent()
+        .remove(&StorageKey::InstallmentSchedule(inv_id.clone()));
+}
+
+/// Count unique investors recorded for a registered invoice.
+pub fn get_investor_count(env: &Env, inv_id: &BytesN<32>) -> u32 {
+    let key = StorageKey::InvestorCount(inv_id.clone());
+    let count = env.storage().persistent().get(&key).unwrap_or(0);
+    if env.storage().persistent().has(&key) {
+        bump_persistent(env, &key);
+    }
+    count
+}
+
+/// Store the unique investor count for a registered invoice.
+pub fn set_investor_count(env: &Env, inv_id: &BytesN<32>, count: u32) {
+    let key = StorageKey::InvestorCount(inv_id.clone());
+    env.storage().persistent().set(&key, &count);
+    bump_persistent(env, &key);
+}
+
+/// Return configured investor cap, defaulting to 500 for existing deployments.
+pub fn get_max_investors(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&StorageKey::MaxInvestors)
+        .unwrap_or(500)
+}
+
+pub fn set_max_investors(env: &Env, count: u32) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::MaxInvestors, &count);
+}
+
+/// Get the configured FX oracle contract, if any.
+pub fn get_fx_oracle(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&StorageKey::FxOracle)
+}
+
+/// Set the FX oracle contract.
+pub fn set_fx_oracle(env: &Env, oracle: &Address) {
+    env.storage().instance().set(&StorageKey::FxOracle, oracle);
+}
+
+/// Get the payment token configured for a supported investment currency.
+pub fn get_currency_token(env: &Env, currency: &Symbol) -> Option<Address> {
+    env.storage()
+        .instance()
+        .get(&StorageKey::Currency(currency.clone()))
+}
+
+/// Set (`Some`) or remove (`None`) the payment token for an investment currency.
+pub fn set_currency_token(env: &Env, currency: &Symbol, token: Option<&Address>) {
+    let key = StorageKey::Currency(currency.clone());
+    match token {
+        Some(token) => env.storage().instance().set(&key, token),
+        None => env.storage().instance().remove(&key),
+    }
+}
+
+/// Get the multi-currency investment records for (invoice_id, investor).
+pub fn get_investment_records(
+    env: &Env,
+    inv_id: &BytesN<32>,
+    investor: &Address,
+) -> Vec<InvestmentRecord> {
+    let key = StorageKey::InvestRecords(inv_id.clone(), investor.clone());
+    let records = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    if env.storage().persistent().has(&key) {
+        bump_persistent(env, &key);
+    }
+    records
+}
+
+/// Append a multi-currency investment record for (invoice_id, investor).
+pub fn add_investment_record(
+    env: &Env,
+    inv_id: &BytesN<32>,
+    investor: &Address,
+    record: &InvestmentRecord,
+) {
+    let key = StorageKey::InvestRecords(inv_id.clone(), investor.clone());
+    let mut records = get_investment_records(env, inv_id, investor);
+    records.push_back(record.clone());
+    env.storage().persistent().set(&key, &records);
+    bump_persistent(env, &key);
+}
+
+// ── Issue #443: Pending param change storage ─────────────────────────────────
+
+pub fn get_pending_param_change(env: &Env) -> Option<crate::types::PendingParamChange> {
+    env.storage()
+        .instance()
+        .get(&StorageKey::PendingParamChange)
+}
+
+pub fn set_pending_param_change(env: &Env, proposal: &crate::types::PendingParamChange) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::PendingParamChange, proposal);
+}
+
+pub fn clear_pending_param_change(env: &Env) {
+    env.storage()
+        .instance()
+        .remove(&StorageKey::PendingParamChange);
+}
+
+// ── Issue #469: Batch TTL extension for off-chain keeper bots ─────────────────
+
+/// Extend the TTL of multiple persistent storage keys in a single call.
+/// Off-chain keeper bots can use this to keep active escrows alive without
+/// issuing separate transactions per key. Only extends keys that exist;
+/// missing keys are silently skipped.
+pub fn batch_extend_ttl(env: &Env, keys: &soroban_sdk::Vec<StorageKey>) {
+    for key in keys.iter() {
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, MIN_TTL_EXTEND);
+        }
+    }
+}
+
+// ── Issue #468: Storage footprint compaction for completed invoices ───────────
+
+/// Remove all persistent storage entries associated with a completed invoice
+/// to reclaim storage footprint. Only call this after the invoice has reached
+/// a terminal state (Settled, Refunded, or Cancelled) and all associated
+/// events have been emitted.
+///
+/// Returns the number of storage keys removed.
+pub fn compact_invoice_storage(
+    env: &Env,
+    inv_id: &Symbol,
+    funder_addresses: &soroban_sdk::Vec<Address>,
+) -> u32 {
+    let mut removed = 0u32;
+
+    // Remove per-funder contribution records
+    for funder in funder_addresses.iter() {
+        let key = StorageKey::FunderAmount(inv_id.clone(), funder);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().remove(&key);
+            removed += 1;
+        }
+    }
+
+    // Remove escrow data
+    let escrow_key = StorageKey::Escrow(inv_id.clone());
+    if env.storage().persistent().has(&escrow_key) {
+        env.storage().persistent().remove(&escrow_key);
+        removed += 1;
+    }
+
+    // Remove dispute record if any
+    let dispute_key = StorageKey::Dispute(inv_id.clone());
+    if env.storage().persistent().has(&dispute_key) {
+        env.storage().persistent().remove(&dispute_key);
+        removed += 1;
+    }
+
+    // Remove installment schedule if any
+    let installment_key = StorageKey::InstallmentSchedule(inv_id.clone());
+    if env.storage().persistent().has(&installment_key) {
+        env.storage().persistent().remove(&installment_key);
+        removed += 1;
+    }
+
+    // Remove emergency approvals if any
+    let emergency_key = StorageKey::EmergencyApprovals(inv_id.clone());
+    if env.storage().persistent().has(&emergency_key) {
+        env.storage().persistent().remove(&emergency_key);
+        removed += 1;
+    }
+
+    removed
 }
